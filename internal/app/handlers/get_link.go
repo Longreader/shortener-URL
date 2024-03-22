@@ -14,9 +14,13 @@ func (h *Handler) IDGetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	url, err := h.st.Get(r.Context(), id)
+	url, deleted, err := h.st.Get(r.Context(), id)
 	if err != nil {
 		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if deleted {
+		w.WriteHeader(http.StatusGone)
 		return
 	}
 

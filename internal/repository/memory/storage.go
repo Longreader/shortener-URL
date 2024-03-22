@@ -6,6 +6,7 @@ import (
 
 	"github.com/Longreader/go-shortener-url.git/internal/repository"
 	"github.com/Longreader/go-shortener-url.git/internal/tools"
+	"github.com/sirupsen/logrus"
 )
 
 type MemoryStorage struct {
@@ -68,17 +69,43 @@ func (st *MemoryStorage) SetLink(
 }
 
 // Get method fot MemoryStorage storage
-func (st *MemoryStorage) Get(_ context.Context, id repository.ID) (url repository.URL, err error) {
+func (st *MemoryStorage) Get(_ context.Context, id repository.ID) (url repository.URL, deleted bool, err error) {
 
 	st.RLock()
 	defer st.RUnlock()
 
 	data, ok := st.UserLinkStorage[id]
 	if ok {
-		return data.URL, nil
+		return data.URL, data.Deleted, nil
 	}
 
-	return "", repository.ErrURLNotFound
+	return "", false, repository.ErrURLNotFound
+}
+
+func (st *MemoryStorage) Delete(_ context.Context, ids []repository.ID, user repository.User) error {
+
+	st.RWMutex.Lock()
+	defer st.RWMutex.Unlock()
+	for _, id := range ids {
+		link, ok := st.UserLinkStorage[id]
+		if !ok {
+			logrus.Error("user does not exist")
+			continue
+		}
+		if link.User != user {
+			logrus.Error("error wrong user")
+			continue
+		}
+		// link.Deleted = true
+		// st.UserLinkStorage[id] = link
+		st.DeleteLink(link, id)
+	}
+	return nil
+}
+
+func (st *MemoryStorage) DeleteLink(link repository.LinkData, id repository.ID) {
+	link.Deleted = true
+	st.UserLinkStorage[id] = link
 }
 
 func (st *MemoryStorage) GetAllByUser(_ context.Context, user repository.User) (data []repository.LinkData, err error) {
@@ -92,6 +119,9 @@ func (st *MemoryStorage) GetAllByUser(_ context.Context, user repository.User) (
 		if value.User != user {
 			continue
 		}
+		if value.Deleted {
+			continue
+		}
 
 		data = append(data, repository.LinkData{
 			ID:   id,
@@ -103,7 +133,15 @@ func (st *MemoryStorage) GetAllByUser(_ context.Context, user repository.User) (
 	return data, nil
 }
 
+func (st *MemoryStorage) RunDelete() {
+	//methon implement interface
+}
+
 // Check connection with Storage
 func (st *MemoryStorage) Ping(_ context.Context) (bool, error) {
 	return true, nil
+}
+
+func (st *MemoryStorage) Close(_ context.Context) error {
+	return nil
 }

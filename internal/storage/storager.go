@@ -18,11 +18,19 @@ type Storager interface {
 	) (id repository.ID, err error)
 	Get( // Получить оригинальную ссылку по ID.
 		ctx context.Context, id repository.ID,
-	) (url repository.URL, err error)
+	) (url repository.URL, deleted bool, err error)
+	Delete( // Удалить указанные ссылки
+		ctx context.Context, ids []repository.ID, user repository.User,
+	) error
+	RunDelete( // Запуск процесса удаления под паттерн FanIn
+	)
 	GetAllByUser( // Получить все ссылки пользователя.
 		ctx context.Context, user repository.User,
 	) (links []repository.LinkData, err error)
-	Ping(ctx context.Context) (bool, error)
+	Ping( // Проверить соединение с базой данных
+		ctx context.Context,
+	) (bool, error)
+	Close(ctx context.Context) error
 }
 
 // StoragerType - int для хранения типа хранилища.

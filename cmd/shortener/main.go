@@ -43,6 +43,8 @@ func main() {
 		h,
 	)
 
+	//s.RunDelete()
+
 	http.Handle("/", r)
 
 	logrus.Info("Start service")

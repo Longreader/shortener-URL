@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/Longreader/go-shortener-url.git/internal/repository"
@@ -15,14 +17,26 @@ import (
 )
 
 type PsqlStorage struct {
-	db *sqlx.DB
+	db       *sqlx.DB
+	deleteCh chan repository.LinkData
+	wg       *sync.WaitGroup
+	stop     chan struct{}
 }
+
+const (
+	delBufferSize    = 50
+	delBufferTimeout = time.Second
+)
 
 func NewPsqlStorage(dsn string) (*PsqlStorage, error) {
 
 	var err error
 
-	st := &PsqlStorage{}
+	st := &PsqlStorage{
+		deleteCh: make(chan repository.LinkData),
+		stop:     make(chan struct{}),
+		wg:       &sync.WaitGroup{},
+	}
 
 	st.db, err = sqlx.Open("pgx", dsn)
 	if err != nil {
@@ -33,6 +47,9 @@ func NewPsqlStorage(dsn string) (*PsqlStorage, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	st.wg.Add(1)
+	st.RunDelete()
 
 	st.Setup()
 
@@ -49,6 +66,7 @@ func (st *PsqlStorage) Setup() {
 		`CREATE TABLE IF NOT EXISTS links (
 			id      varchar(255) NOT NULL UNIQUE,
 			url     varchar(255) NOT NULL UNIQUE,
+			deleted bool 		 NOT NULL DEFAULT FALSE,
 			user_id uuid         NOT NULL
 		);`,
 	)
@@ -102,24 +120,94 @@ func (st *PsqlStorage) Set(
 func (st *PsqlStorage) Get(
 	ctx context.Context,
 	id repository.ID,
-) (url repository.URL, err error) {
+) (url repository.URL, deleted bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
 	row := st.db.QueryRowContext(
 		ctx,
-		`SELECT url FROM links WHERE id=$1`,
+		`SELECT url, deleted FROM links WHERE id=$1`,
 		id,
 	)
 
-	err = row.Scan(&url)
+	err = row.Scan(&url, &deleted)
 
 	if err == sql.ErrNoRows {
-		return "", repository.ErrURLNotFound
+		return "", false, repository.ErrURLNotFound
 	} else if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return url, nil
+	return url, deleted, nil
+}
+
+func (st *PsqlStorage) Delete(
+	ctx context.Context,
+	ids []repository.ID,
+	user repository.User,
+) error {
+	for _, id := range ids {
+		st.deleteCh <- repository.LinkData{ID: id, User: user}
+	}
+	return nil
+}
+
+func (st *PsqlStorage) DeleteLink(ids []repository.ID, users []repository.User) {
+
+	ctxLocal, cancelLocal := context.WithTimeout(context.Background(), delBufferTimeout)
+
+	_, err := st.db.ExecContext(
+		ctxLocal,
+		`UPDATE links SET deleted = TRUE
+			FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::uuid[]) AS user) AS data_table
+			WHERE links.id = data_table.id AND user_id = data_table.user`,
+		ids, users,
+	)
+	if err != nil {
+		log.Printf("update failed: %v", err)
+	}
+	cancelLocal()
+
+}
+
+func (st *PsqlStorage) RunDelete() {
+
+	go func() {
+		ids := make([]repository.ID, 0, delBufferSize)
+		users := make([]repository.User, 0, delBufferSize)
+		theTicker := time.NewTicker(delBufferTimeout)
+		defer theTicker.Stop()
+		for {
+			//timer := time.NewTimer(delBufferTimeout)
+			select {
+			case <-theTicker.C:
+				if len(ids) != 0 || len(users) != 0 {
+					st.DeleteLink(ids, users)
+				}
+				ids = ids[:0]
+				users = users[:0]
+			case <-st.stop:
+				if len(ids) != 0 || len(users) != 0 {
+					st.DeleteLink(ids, users)
+				}
+				st.wg.Done()
+				return
+			case data, ok := <-st.deleteCh:
+				if !ok {
+					st.wg.Done()
+					return
+				}
+				if len(ids) != 0 || len(users) != 0 {
+					st.DeleteLink(ids, users)
+				}
+				if len(ids) == delBufferSize-1 || len(users) == delBufferSize-1 {
+					ids = ids[:0]
+					users = users[:0]
+				}
+				ids = append(ids, data.ID)
+				users = append(users, data.User)
+			}
+		}
+	}()
 
 }
 
@@ -132,7 +220,7 @@ func (st *PsqlStorage) GetAllByUser(
 
 	rows, err := st.db.QueryContext(
 		ctx,
-		`SELECT url, id, user_id FROM links WHERE user_id=$1`,
+		`SELECT url, id, user_id FROM links WHERE user_id=$1 and deleted=FALSE`,
 		user,
 	)
 
@@ -162,12 +250,21 @@ func (st *PsqlStorage) GetAllByUser(
 }
 
 func (st *PsqlStorage) Ping(ctx context.Context) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 	err := st.db.PingContext(ctx)
 	if err != nil {
+		cancel()
 		return false, err
 	}
 	return true, nil
+}
+
+func (st *PsqlStorage) Close(_ context.Context) error {
+
+	st.stop <- struct{}{}
+	st.wg.Wait()
+	close(st.stop)
+	return st.db.Close()
 }
